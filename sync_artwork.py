@@ -619,7 +619,7 @@ class TVArtworkSync:
         logger.info(f"Found {len(local_files)} images in {ARTWORK_DIR}")
         return local_files
 
-    async def get_tv_images(self) -> tuple[Set[str], Set[str]]:
+    async def get_tv_images(self) -> Optional[tuple[Set[str], Set[str]]]:
         """
         Get list of uploaded images on the TV.
 
@@ -627,6 +627,11 @@ class TVArtworkSync:
             Tuple of (tracked_files, unknown_content_ids):
             - tracked_files: Set of filenames we've uploaded and are tracking
             - unknown_content_ids: Set of content_ids on TV that we don't recognize
+
+            Or None if the TV's content list could not be read at all. Callers
+            must not treat that as "the TV is empty": doing so makes every local
+            image look missing and re-uploads the whole folder, every cycle. That
+            is how a two-image folder ends up as twenty copies on the TV.
         """
         try:
             # Get available images from "MY-C0002" category (My Photos/uploaded images only)
@@ -657,8 +662,10 @@ class TVArtworkSync:
             return tracked_files, unknown_content_ids
 
         except Exception as e:
-            logger.warning(f"Failed to get uploaded images from TV {self.tv_ip}: {e}")
-            return set(), set()
+            logger.warning(
+                f"Failed to get uploaded images from TV {self.tv_ip}: {type(e).__name__}: {e}"
+            )
+            return None
 
     async def upload_image(self, file_path: Path) -> bool:
         """Upload a single image to the TV with retry logic.
@@ -867,7 +874,20 @@ class TVArtworkSync:
                 local_images = await self.get_local_images()
 
             # Get TV images (tracked and unknown)
-            tv_images, unknown_images = await self.get_tv_images()
+            tv_state = await self.get_tv_images()
+
+            # If we couldn't read what's already on the TV, do nothing this cycle.
+            # Assuming "empty" here would re-upload the entire folder every sync,
+            # stacking duplicate copies on the TV until someone notices.
+            if tv_state is None:
+                logger.warning(
+                    f"Skipping sync for TV {self.tv_ip}: could not read its current "
+                    f"image list, so there is no safe way to tell what needs uploading. "
+                    f"Will retry next cycle."
+                )
+                return False
+
+            tv_images, unknown_images = tv_state
 
             # Determine what to upload and delete
             to_upload = local_images - tv_images
@@ -956,8 +976,15 @@ class TVArtworkSync:
                 # Verify file_mapping against what's actually on the TV now
                 verified_mapping = {}
                 try:
-                    current_on_tv, _ = await self.get_tv_images()
-                    verified_mapping = {k: v for k, v in self.file_mapping.items() if k in current_on_tv}
+                    tv_state_now = await self.get_tv_images()
+                    if tv_state_now is None:
+                        # Couldn't re-read the TV; trust the mapping rather than
+                        # narrowing it to nothing and skipping image selection.
+                        logger.debug(f"Could not verify TV images for selection on {self.tv_ip}")
+                        verified_mapping = self.file_mapping
+                    else:
+                        current_on_tv, _ = tv_state_now
+                        verified_mapping = {k: v for k, v in self.file_mapping.items() if k in current_on_tv}
                 except Exception as e:
                     logger.debug(f"Could not verify TV images for selection on {self.tv_ip}: {e}")
                     verified_mapping = self.file_mapping
