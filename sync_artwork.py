@@ -135,7 +135,16 @@ CONNECT_MAX_ATTEMPTS = int(os.getenv('CONNECT_MAX_ATTEMPTS', '3'))
 CHANNEL_DROP_RETRY_DELAY = float(os.getenv('CHANNEL_DROP_RETRY_DELAY', '3.0'))
 PAIRING_MAX_RETRIES = int(os.getenv('PAIRING_MAX_RETRIES', '5'))
 PAIRING_RETRY_DELAY = float(os.getenv('PAIRING_RETRY_DELAY', '5.0'))
-API_TIMEOUT = 10
+# Generic art-app request timeout. Slower TVs take most of 10s just to answer
+# get_slideshow_status, so the old hard-coded 10 was right on the edge.
+API_TIMEOUT = int(os.getenv('API_TIMEOUT', '20'))
+# How long to wait for the TV's uploaded-image list. Upstream's default is 4s,
+# which is far too short on a TV with a large art collection: serialising the
+# list is done TV-side and the reply arrives in one big message. A 2022 Frame
+# with ~500 images sends ~766KB and takes about 10 seconds. Timing out here is
+# not harmless — the caller can't tell "slow" from "empty", so the whole folder
+# looks missing and gets re-uploaded every cycle.
+CONTENT_LIST_TIMEOUT = int(os.getenv('CONTENT_LIST_TIMEOUT', '45'))
 
 # Validate intervals — values < 1 cause busy/infinite loops in wait_until_next_sync
 if SYNC_INTERVAL_MINUTES < 1:
@@ -635,7 +644,9 @@ class TVArtworkSync:
         """
         try:
             # Get available images from "MY-C0002" category (My Photos/uploaded images only)
-            available = await self.tv.available(category='MY-C0002')
+            available = await self.tv.available(
+                category='MY-C0002', timeout=CONTENT_LIST_TIMEOUT
+            )
             tv_content_ids = set()
 
             # Debug: log the raw response

@@ -210,8 +210,12 @@ Advanced knobs for the TV WebSocket connection. Defaults work for most setups; t
 | `CHANNEL_DROP_RETRY_DELAY` | Seconds to wait between connect retries after a channel drop                                             | `3.0`   |
 | `PAIRING_MAX_RETRIES`      | Retries while waiting for first-time pairing approval on the TV                                          | `5`     |
 | `PAIRING_RETRY_DELAY`      | Seconds between pairing retries (sized for human reaction time)                                          | `5.0`   |
+| `API_TIMEOUT`              | Seconds to wait for a general art-app request (slideshow status, etc.)                                   | `20`    |
+| `CONTENT_LIST_TIMEOUT`     | Seconds to wait for the TV's list of uploaded images. Raise this if you have a large art collection.      | `45`    |
 
 The keepalive ping prevents some Frame TVs from prompting for re-authentication between syncs. If you have a flaky network or notice repeated re-auth prompts, you can increase `PAIRING_MAX_RETRIES` or shorten `KEEPALIVE_INTERVAL`.
+
+`CONTENT_LIST_TIMEOUT` matters more than it looks. The TV builds the whole list in one message, so the reply gets slower as your collection grows — a Frame with ~500 images takes about 10 seconds to send ~750KB. If it times out, the sync can't tell "slow" from "empty", so it skips that cycle rather than risk re-uploading your whole folder. If the logs show `Failed to get uploaded images from TV`, raise this value.
 
 ## Image Requirements
 
