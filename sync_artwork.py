@@ -592,18 +592,38 @@ class TVArtworkSync:
     async def is_in_art_mode(self) -> bool:
         """Check if the TV is currently in art mode (not being used for other content)"""
         try:
-            # First check if TV is on
-            is_on = await self.tv.on()
-            if not is_on:
-                # TV is off - safe to skip (will be synced when it turns on)
-                logger.debug(f"TV {self.tv_ip} is powered off")
+            # Read device info ourselves rather than calling tv.on(). Upstream's
+            # _get_device_info() swallows every exception and returns {}, and on()
+            # then reads that as PowerState 'off' — so a REST blip is indistinguishable
+            # from a powered-off TV, and we would silently skip a TV that is sitting
+            # there in art mode. That path also bypasses the except below, which
+            # exists precisely to keep syncing when the state is unknown.
+            device_info = await self.tv._get_device_info()
+            if not device_info:
+                logger.warning(
+                    f"Could not read device info for TV {self.tv_ip} (REST call failed "
+                    f"or returned nothing) — assuming it is available and syncing anyway"
+                )
+                return True
+
+            power_state = device_info.get("device", {}).get("PowerState", "unknown")
+            if power_state != "on":
+                logger.info(f"Skipping TV {self.tv_ip}: PowerState={power_state}")
                 return False
 
             # Check if TV is in art mode
             art_mode_status = await self.tv.get_artmode()
             is_art_mode = art_mode_status == 'on'
 
-            logger.debug(f"TV {self.tv_ip} art mode status: {art_mode_status}")
+            if not is_art_mode:
+                # Logged at info, not debug, so a skip says *why*. Deliberately
+                # factual: a TV legitimately in use reports 'off' every cycle for
+                # as long as someone is watching, so this must not editorialise
+                # about stale tokens — see the troubleshooting note in the README
+                # for the case where a TV reports 'off' while visibly in art mode.
+                logger.info(f"TV {self.tv_ip} reports art mode status: {art_mode_status}")
+            else:
+                logger.debug(f"TV {self.tv_ip} art mode status: {art_mode_status}")
             return is_art_mode
 
         except Exception as e:
