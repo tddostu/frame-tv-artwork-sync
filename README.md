@@ -317,6 +317,42 @@ If no images change during a sync cycle, slideshow settings are not modified.
 
 ## Troubleshooting
 
+### A TV is skipped as "not in art mode"
+
+`Skipping TV <ip> - not in art mode (may be in use)` means the TV answered our
+status request and reported art mode as off. Measured on a 2024 Frame
+(`24_PTM_FTV_T09`), switching only the input:
+
+| TV state              | `PowerState` | `get_artmode_status` |
+| --------------------- | ------------ | -------------------- |
+| Art mode              | `on`         | `on`                 |
+| Showing an HDMI input | `on`         | `off`                |
+
+Note `PowerState` stays `on` in both cases — a TV displaying an HDMI source is
+"on" as far as the REST API is concerned, so art mode status is the only signal
+that distinguishes them.
+
+So one common cause is simply that something switched the TV to an input.
+HDMI-CEC does this on its own: an attached device asserting "active source"
+pulls the TV out of art mode. The TV records it under Settings > Support >
+About This TV > Event Log as "CEC Command, Source enabled" — compare those
+timestamps against the skips in your sync log. Note the container logs in UTC
+unless you set `TZ`, so convert before comparing.
+
+**Known unexplained case.** A 2024 Frame has been observed reporting art mode
+`off`, repeatedly, while visibly displaying artwork, with a connection approval
+prompt on screen at the time. That is not explained by the above, and it is not
+caused by the token being rejected: connecting with a deliberately invalid token
+was measured on the same TV, and `get_artmode_status` did not return `off` — the
+art channel handshake failed outright and the call raised, which the sync script
+treats as "state unknown" and syncs anyway. What has *not* been tested is a
+valid token while a prompt raised by some other client is on screen. If you can
+reproduce this, a `LOG_LEVEL=DEBUG` log would be very welcome.
+
+Related: approving a prompt raised by an art-channel connection never yielded a
+token in testing. Only the remote-control channel, used during first-time
+pairing, has been observed handing one back.
+
 ### Debug Logging
 
 Set `LOG_LEVEL=DEBUG` in your environment to see detailed sync operations and TV responses.
