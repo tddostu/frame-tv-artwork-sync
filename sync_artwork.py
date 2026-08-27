@@ -18,12 +18,20 @@ import time
 import hashlib
 import datetime
 import zoneinfo
+import socket
 
 from samsungtvws import async_connection
 from samsungtvws.async_art import SamsungTVAsyncArt
 from samsungtvws.async_remote import SamsungTVWSAsyncRemote
+from samsungtvws.connection import SamsungTVWSConnection
 from samsungtvws.exceptions import ConnectionFailure, UnauthorizedError
-from samsungtvws.remote import SamsungTVWS, SendRemoteKey
+from samsungtvws.remote import REMOTE_ENDPOINT, SendRemoteKey
+from samsung_ip_control import (
+    IPControlAuthError,
+    IPControlError,
+    IPControlTransportError,
+    SamsungIPControl,
+)
 
 # Track websockets created during a channel handshake so we can close orphans.
 #
@@ -39,6 +47,11 @@ from samsungtvws.remote import SamsungTVWS, SendRemoteKey
 # the same list object the caller created. If upstream ever stops routing through
 # this name the box simply stays empty and we're back to the old behaviour.
 _handshake_sockets: contextvars.ContextVar = contextvars.ContextVar('handshake_sockets', default=None)
+
+# TVs whose guarded Art-token refresh was already offered but not completed.
+# Keep this in memory so an unattended TV is not prompted every sync cycle. A
+# later successful Art connection clears the entry, as does a service restart.
+_ART_TOKEN_REFRESH_ATTEMPTED: Set[str] = set()
 
 if callable(getattr(async_connection, 'connect', None)):
     _upstream_ws_connect = async_connection.connect
@@ -59,16 +72,49 @@ else:
         "disabled (upstream API changed). Timed-out handshakes may leak a socket."
     )
 
-# Patch SamsungTVAsyncArt.get_token to forward the name parameter.
-# Upstream's get_token creates a temporary SamsungTVWS for token negotiation
-# but doesn't forward `name`, so the TV registers the lib's default name on
-# first-time pairing instead of CLIENT_NAME.
-def _get_token_with_name(self):
-    SamsungTVWS(self.host, port=self.port, token=self.token,
-                token_file=self.token_file, timeout=self.timeout,
-                name=self.name)
+# A Frame may broadcast Art requests and other clients' disconnects to a newly
+# opened socket before sending that socket's own ms.channel.connect event. The
+# upstream connection routine treats any unrecognized first event as a failed
+# authentication handshake. That caused valid tokens to look stale and could
+# launch an unnecessary pairing flow when another controller (such as Home
+# Assistant) was active. These events carry no definitive authentication result,
+# so keep waiting for connect within _bounded_art_call's overall deadline.
+_ART_STARTUP_BROADCAST_EVENTS = (
+    'art_app_request',
+    'd2d_service_message',
+    'ms.channel.clientDisconnect',
+)
+if hasattr(async_connection, 'IGNORE_EVENTS_AT_STARTUP'):
+    async_connection.IGNORE_EVENTS_AT_STARTUP = tuple(dict.fromkeys(
+        (*async_connection.IGNORE_EVENTS_AT_STARTUP, *_ART_STARTUP_BROADCAST_EVENTS)
+    ))
 
-SamsungTVAsyncArt.get_token = _get_token_with_name
+_upstream_async_connection_open = async_connection.SamsungTVWSAsyncConnection.open
+
+
+async def _open_art_channel_ignoring_broadcasts(self):
+    """Accept ms.channel.connect as a complete Art handshake.
+
+    Newer Frames do not reliably send the additional ms.channel.ready event.
+    The base open still verifies connect/unauthorized/timeout and captures any
+    issued token. SamsungTVAsyncArt's listener can safely consume a late ready
+    event alongside the normal Art responses.
+    """
+    return await _upstream_async_connection_open(self)
+
+
+SamsungTVAsyncArt.open = _open_art_channel_ignoring_broadcasts
+
+# Token acquisition is explicit in _acquire_token(). Upstream's Art-client
+# constructor otherwise creates a high-level remote client here, which performs
+# a hidden REST probe and may open another pairing window on newer TVs. Besides
+# duplicating prompts, that extra socket can contribute to the Art channel
+# saturation we observed on a 2025 Frame. Constructing an Art client must never
+# initiate pairing by itself.
+def _skip_implicit_art_token_pairing(self):
+    return None
+
+SamsungTVAsyncArt.get_token = _skip_implicit_art_token_pairing
 
 from pysolar.solar import get_altitude
 
@@ -115,6 +161,11 @@ CLIENT_NAME = os.getenv('CLIENT_NAME', 'FrameTVArtworkSync')
 # Optional auto-off settings (turn off TVs at a specific time when in art mode)
 AUTO_OFF_TIME = os.getenv('AUTO_OFF_TIME', '')  # 24-hour format, e.g., "22:00"
 AUTO_OFF_GRACE_HOURS = float(os.getenv('AUTO_OFF_GRACE_HOURS', '2'))  # Hours after AUTO_OFF_TIME to keep trying
+# Optional auto-on setting. It is attempted once per scheduled day.
+AUTO_ON_TIME = os.getenv('AUTO_ON_TIME', '')  # 24-hour format, e.g., "07:00"
+WOL_BROADCAST_ADDRESS = os.getenv('WOL_BROADCAST_ADDRESS', '255.255.255.255')
+WOL_PORT = int(os.getenv('WOL_PORT', '9'))
+WOL_REPEAT = int(os.getenv('WOL_REPEAT', '3'))
 
 # Dry run mode (set by command line argument)
 DRY_RUN = False
@@ -135,6 +186,7 @@ CONNECT_MAX_ATTEMPTS = int(os.getenv('CONNECT_MAX_ATTEMPTS', '3'))
 CHANNEL_DROP_RETRY_DELAY = float(os.getenv('CHANNEL_DROP_RETRY_DELAY', '3.0'))
 PAIRING_MAX_RETRIES = int(os.getenv('PAIRING_MAX_RETRIES', '5'))
 PAIRING_RETRY_DELAY = float(os.getenv('PAIRING_RETRY_DELAY', '5.0'))
+FAST_PAIRING_TIMEOUT_THRESHOLD = 3.0
 # Generic art-app request timeout. Slower TVs take most of 10s just to answer
 # get_slideshow_status, so the old hard-coded 10 was right on the edge.
 API_TIMEOUT = int(os.getenv('API_TIMEOUT', '20'))
@@ -157,21 +209,28 @@ UPLOAD_DELAY = 1.0
 DELETE_DELAY = 0.5
 UPLOAD_ATTEMPTS = 2
 POWER_OFF_VERIFY_DELAY = 5.0  # Seconds to wait after a power-off before checking it took effect
+POWER_ON_VERIFY_TIMEOUT = float(os.getenv('POWER_ON_VERIFY_TIMEOUT', '30.0'))
+_AUTO_ON_LAST_ATTEMPT: Optional[datetime.date] = None
 
 
-def is_within_auto_off_window() -> bool:
+def power_control_configured() -> bool:
+    """Return whether this installation needs automatic IP Control pairing."""
+    return bool(AUTO_ON_TIME or AUTO_OFF_TIME)
+
+
+def is_within_schedule_window(schedule_time: str, grace_hours: float, label: str) -> bool:
     """
-    Check if the current time is within the auto-off window.
+    Check if the current time is within a daily schedule window.
 
-    The window starts at AUTO_OFF_TIME and extends for AUTO_OFF_GRACE_HOURS.
-    Returns True if we should attempt to turn off TVs that are in art mode.
+    The window starts at schedule_time and extends for grace_hours, including
+    windows that cross midnight.
     """
-    if not AUTO_OFF_TIME:
+    if not schedule_time:
         return False
 
     try:
         # Parse the configured off time
-        off_hour, off_minute = map(int, AUTO_OFF_TIME.split(':'))
+        off_hour, off_minute = map(int, schedule_time.split(':'))
 
         # Get current time in the configured timezone
         tz = zoneinfo.ZoneInfo(LOCATION_TIMEZONE)
@@ -181,26 +240,57 @@ def is_within_auto_off_window() -> bool:
         today_off_time = now.replace(hour=off_hour, minute=off_minute, second=0, microsecond=0)
 
         # Calculate the end of the grace period
-        grace_end = today_off_time + datetime.timedelta(hours=AUTO_OFF_GRACE_HOURS)
+        grace_end = today_off_time + datetime.timedelta(hours=grace_hours)
 
         # Handle the case where the window spans midnight
         # If we're before today's off time, check if we're in yesterday's window
         if now < today_off_time:
             yesterday_off_time = today_off_time - datetime.timedelta(days=1)
-            yesterday_grace_end = yesterday_off_time + datetime.timedelta(hours=AUTO_OFF_GRACE_HOURS)
+            yesterday_grace_end = yesterday_off_time + datetime.timedelta(hours=grace_hours)
             if yesterday_off_time <= now < yesterday_grace_end:
-                logger.debug(f"Within auto-off window (from yesterday): {yesterday_off_time.strftime('%H:%M')} to {yesterday_grace_end.strftime('%H:%M')}")
+                logger.debug(f"Within {label} window (from yesterday): {yesterday_off_time.strftime('%H:%M')} to {yesterday_grace_end.strftime('%H:%M')}")
                 return True
 
         # Check if we're in today's window
         if today_off_time <= now < grace_end:
-            logger.debug(f"Within auto-off window: {today_off_time.strftime('%H:%M')} to {grace_end.strftime('%H:%M')}")
+            logger.debug(f"Within {label} window: {today_off_time.strftime('%H:%M')} to {grace_end.strftime('%H:%M')}")
             return True
 
         return False
 
     except Exception as e:
-        logger.warning(f"Failed to check auto-off window: {e}")
+        logger.warning(f"Failed to check {label} window: {e}")
+        return False
+
+
+def is_within_auto_off_window() -> bool:
+    """Return whether the current time is in the configured auto-off window."""
+    return is_within_schedule_window(AUTO_OFF_TIME, AUTO_OFF_GRACE_HOURS, 'auto-off')
+
+
+def should_attempt_auto_on() -> bool:
+    """Return True once on the first polling cycle after today's on time."""
+    global _AUTO_ON_LAST_ATTEMPT
+    if not AUTO_ON_TIME:
+        return False
+    try:
+        hour, minute = map(int, AUTO_ON_TIME.split(':'))
+        tz = zoneinfo.ZoneInfo(LOCATION_TIMEZONE)
+        now = datetime.datetime.now(tz)
+        scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        # The loop normally runs exactly once per SYNC_INTERVAL_MINUTES. Add a
+        # small margin for connection work so the scheduled edge is not missed.
+        attempt_deadline = scheduled + datetime.timedelta(
+            minutes=SYNC_INTERVAL_MINUTES + 1
+        )
+        if not scheduled <= now < attempt_deadline:
+            return False
+        if _AUTO_ON_LAST_ATTEMPT == scheduled.date():
+            return False
+        _AUTO_ON_LAST_ATTEMPT = scheduled.date()
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to check auto-on time: {e}")
         return False
 
 
@@ -304,10 +394,109 @@ class TVArtworkSync:
     def __init__(self, tv_ip: str) -> None:
         self.tv_ip = tv_ip
         self.tv = None
+        self.last_art_mode_status: Optional[str] = None
+        self.auto_started = False
         self.token_file = Path(TOKEN_DIR) / f'tv_{tv_ip.replace(".", "_")}.txt'
+        self.ip_control_file = Path(TOKEN_DIR) / f'tv_{tv_ip.replace(".", "_")}_ip_control.json'
+        self.mac_file = Path(TOKEN_DIR) / f'tv_{tv_ip.replace(".", "_")}_mac.txt'
+        self.ip_control = SamsungIPControl(self.tv_ip, self.ip_control_file)
         self.mapping_file = Path(TOKEN_DIR) / f'tv_{tv_ip.replace(".", "_")}_mapping.json'
         self.file_mapping: Dict[str, str] = {}  # filename -> content_id mapping
         self._load_mapping()
+
+    def _save_mac(self, mac: str) -> None:
+        """Persist the TV MAC for Wake-on-LAN fallback."""
+        normalized = re.sub(r'[^0-9A-Fa-f]', '', mac)
+        if len(normalized) != 12:
+            return
+        self.mac_file.parent.mkdir(parents=True, exist_ok=True)
+        self.mac_file.write_text(normalized.lower() + '\n')
+
+    def _load_mac(self) -> Optional[str]:
+        try:
+            value = re.sub(r'[^0-9A-Fa-f]', '', self.mac_file.read_text())
+            return value if len(value) == 12 else None
+        except OSError:
+            return None
+
+    async def pair_ip_control(self) -> bool:
+        """Pair Samsung IP Control and persist its token/working port."""
+        if self.ip_control.paired:
+            logger.info(f"IP Control already paired for TV {self.tv_ip}")
+            return True
+        try:
+            logger.info(
+                f"Waiting for IP Control approval on TV {self.tv_ip}; "
+                "the TV must be in normal viewing, not Art Mode"
+            )
+            await self.ip_control.pair()
+            logger.info(f"IP Control paired for TV {self.tv_ip} on port {self.ip_control.port}")
+            return True
+        except IPControlError as e:
+            logger.warning(f"IP Control pairing failed for TV {self.tv_ip}: {e}")
+            return False
+
+    async def _pair_missing_ip_control(self, art_mode_status: Any) -> None:
+        """Acquire the second Samsung permission during normal sync pairing.
+
+        The IP Control endpoint does not answer pairing requests from Art Mode,
+        so defer silently until a sync sees the TV in normal viewing. Pairing
+        failure never blocks artwork syncing; a later normal-viewing cycle can
+        request approval again.
+        """
+        if not power_control_configured() or self.ip_control.paired:
+            return
+        if str(art_mode_status).lower() == 'on':
+            logger.info(
+                f"IP Control is not paired for TV {self.tv_ip}; authorization "
+                "will be requested during a sync while the TV is in normal viewing"
+            )
+            return
+        logger.info(
+            f"Requesting the additional IP Control approval for TV {self.tv_ip}"
+        )
+        await self.pair_ip_control()
+
+    async def _wait_for_port(self, port: int, timeout: float) -> bool:
+        """Wait until a TCP port responds, without opening a Samsung channel."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.tv_ip, port), timeout=2
+                )
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except OSError:
+                    pass
+                return True
+            except (asyncio.TimeoutError, OSError):
+                await asyncio.sleep(1)
+        return False
+
+    async def _send_wol(self) -> bool:
+        """Send WOL as a fallback when deep standby closes IP Control."""
+        mac = self._load_mac()
+        if not mac:
+            logger.warning(f"No learned MAC for TV {self.tv_ip}; cannot use WOL fallback")
+            return False
+        packet = b'\xff' * 6 + bytes.fromhex(mac) * 16
+
+        def send() -> None:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                for attempt in range(max(1, WOL_REPEAT)):
+                    if attempt:
+                        time.sleep(0.25)
+                    sock.sendto(packet, (WOL_BROADCAST_ADDRESS, WOL_PORT))
+
+        try:
+            await asyncio.to_thread(send)
+            return True
+        except OSError as e:
+            logger.warning(f"WOL failed for TV {self.tv_ip}: {e}")
+            return False
 
     def _load_mapping(self) -> None:
         """Load filename to content_id mapping from disk"""
@@ -347,13 +536,14 @@ class TVArtworkSync:
         don't count against the attempt budget — _acquire_token has its own
         internal retry loop sized for human reaction time.
         """
+        ip_pair_attempted = False
+        had_saved_art_token = self.token_file.exists()
+        art_token_refresh_attempted = False
         for attempt in range(1, CONNECT_MAX_ATTEMPTS + 1):
-            # Probe before anything else, for two reasons: the pairing flow
-            # can't distinguish "TV unreachable" from "waiting for approval"
-            # (it swallows connection errors), and constructing the client
-            # issues synchronous REST calls that block the event loop for the
-            # full timeout when the TV is unreachable — stalling the other
-            # TVs' in-flight connects past their own handshake timeouts.
+            # Probe before anything else because the pairing flow cannot
+            # distinguish "TV unreachable" from "waiting for approval" and
+            # would otherwise spend the full human-approval timeout on an
+            # offline TV.
             if not await self._is_tv_reachable():
                 logger.warning(f"Failed to connect to TV at {self.tv_ip} (TV may be off or unreachable)")
                 return False
@@ -361,13 +551,16 @@ class TVArtworkSync:
             # Acquire a token first if we don't have one.
             if not self.token_file.exists():
                 if not await self._acquire_token():
-                    logger.warning(f"Failed to acquire token for TV {self.tv_ip}, retrying...")
-                    await asyncio.sleep(CHANNEL_DROP_RETRY_DELAY)
-                    continue
+                    # _acquire_token() owns the complete human-approval retry
+                    # budget. Re-entering it through this connection loop would
+                    # multiply PAIRING_MAX_RETRIES by CONNECT_MAX_ATTEMPTS and
+                    # produce a long stream of duplicate TV prompts.
+                    logger.warning(f"Failed to acquire token for TV {self.tv_ip}")
+                    return False
 
-            # Use the token. The constructor performs synchronous REST and
-            # token-negotiation calls internally, so run it in a thread to
-            # keep the event loop free for the other TVs' connects.
+            # Use the token. Keep construction off the event loop for upstream
+            # compatibility, although the implicit token-negotiation hook is
+            # disabled above and all pairing is handled explicitly.
             t0 = time.monotonic()
             try:
                 self.tv = await asyncio.to_thread(
@@ -390,14 +583,43 @@ class TVArtworkSync:
                 # A TV that accepts the socket but never sends that event would
                 # hang this coroutine forever — and since sync_all_tvs gathers
                 # all TVs' connects, that wedges the entire sync loop.
-                await self._bounded_art_call(self.tv.get_artmode, CONNECTION_TIMEOUT)
+                art_mode_status = await self._bounded_art_call(
+                    self.tv.get_artmode, CONNECTION_TIMEOUT
+                )
+                self.last_art_mode_status = str(art_mode_status).lower()
+                _ART_TOKEN_REFRESH_ATTEMPTED.discard(self.tv_ip)
                 logger.info(f"Successfully connected to TV at {self.tv_ip} (attempt {attempt})")
+                await self._pair_missing_ip_control(art_mode_status)
                 return True
 
-            except asyncio.TimeoutError:
-                logger.warning(f"Connection to TV at {self.tv_ip} timed out (TV may be off)")
+            except (asyncio.TimeoutError, AssertionError):
+                # _is_tv_reachable already proved port 8002 accepted a TCP
+                # connection. Upstream raises AssertionError when its internal
+                # get_artmode response wait expires, while our outer handshake
+                # deadline raises TimeoutError. Both mean the Art channel did
+                # not produce a usable status, not that the TV is off.
+                logger.warning(
+                    f"Art channel handshake/status request timed out for TV {self.tv_ip} "
+                    f"(attempt {attempt}); retrying with the saved token..."
+                )
                 await self.close()
-                return False
+                if (
+                    power_control_configured()
+                    and not self.ip_control.paired
+                    and not ip_pair_attempted
+                ):
+                    # Some TVs do not complete the Art channel while showing a
+                    # normal HDMI/TV source. That is precisely when IP Control
+                    # can be approved, so do not make its automatic pairing
+                    # depend on a successful get_artmode response.
+                    ip_pair_attempted = True
+                    logger.info(
+                        f"Art mode could not be determined for TV {self.tv_ip}; "
+                        "requesting the missing IP Control approval now"
+                    )
+                    await self.pair_ip_control()
+                await asyncio.sleep(CHANNEL_DROP_RETRY_DELAY)
+                continue
 
             except UnauthorizedError:
                 logger.warning(f"Token rejected by TV {self.tv_ip}, deleting and re-pairing...")
@@ -407,23 +629,53 @@ class TVArtworkSync:
             except ConnectionFailure as e:
                 # Upstream raises ConnectionFailure for ms.channel.timeOut and
                 # ms.channel.clientDisconnect events during the initial handshake.
-                # Per upstream's own diagnostics, ms.channel.timeOut means
-                # "connection not accepted on TV, or token missing/incorrect" — so
-                # treat it as a token rejection. ms.channel.clientDisconnect is more
-                # ambiguous; treat it as transient.
+                # ms.channel.timeOut is ambiguous: it can mean a rejected token,
+                # but also that the TV did not accept the channel in time. Only
+                # UnauthorizedError is definitive enough to destroy a persisted
+                # token. Preserve it here so a transient TV-side timeout cannot
+                # turn an unattended sync into a fresh pairing loop.
                 elapsed = time.monotonic() - t0
                 event = ""
                 if e.args and isinstance(e.args[0], dict):
                     event = e.args[0].get("event", "")
 
-                if event == "ms.channel.timeOut" and self.token_file.exists():
-                    logger.warning(f"TV {self.tv_ip} rejected token (event={event}, elapsed={elapsed:.2f}s) — deleting and re-pairing...")
-                    self.token_file.unlink()
-                    continue
-                else:
-                    logger.warning(f"Channel drop for TV {self.tv_ip} ({event}, attempt {attempt}) after {elapsed:.2f}s, retrying...")
-                    await asyncio.sleep(CHANNEL_DROP_RETRY_DELAY)
-                    continue
+                logger.warning(
+                    f"Channel drop for TV {self.tv_ip} ({event}, attempt {attempt}) "
+                    f"after {elapsed:.2f}s; preserving its saved token..."
+                )
+                if (
+                    event == "ms.channel.timeOut"
+                    and power_control_configured()
+                    and not self.ip_control.paired
+                    and not ip_pair_attempted
+                ):
+                    ip_pair_attempted = True
+                    logger.info(
+                        f"Art mode could not be determined for TV {self.tv_ip}; "
+                        "requesting the missing IP Control approval now"
+                    )
+                    await self.pair_ip_control()
+
+                if (
+                    event == "ms.channel.timeOut"
+                    and had_saved_art_token
+                    and not art_token_refresh_attempted
+                    and self.tv_ip not in _ART_TOKEN_REFRESH_ATTEMPTED
+                    and await self._reports_powered_on()
+                ):
+                    art_token_refresh_attempted = True
+                    _ART_TOKEN_REFRESH_ATTEMPTED.add(self.tv_ip)
+                    if await self._refresh_art_token_once():
+                        # The failed saved-token request may already have shown
+                        # an ineffective approval prompt. Reconnect immediately
+                        # with the replacement; do not repeat the stale token.
+                        continue
+                    # One guarded tokenless request is enough for this cycle.
+                    # Avoid a confusing stream of approval prompts when nobody
+                    # is present to approve it.
+                    return False
+                await asyncio.sleep(CHANNEL_DROP_RETRY_DELAY)
+                continue
 
             except Exception as e:
                 # Include the type: upstream asserts on a missing response, and a
@@ -433,6 +685,124 @@ class TVArtworkSync:
                 return False
 
         logger.warning(f"Giving up connecting to TV at {self.tv_ip} after {CONNECT_MAX_ATTEMPTS} attempts")
+        return False
+
+    async def _reports_powered_on(self) -> bool:
+        """Return True only when an authoritative source says the TV is awake."""
+        if self.ip_control.paired:
+            try:
+                power_state = await self.ip_control.get_power_state()
+                if power_state == 'powerOn':
+                    return True
+                if power_state == 'powerOff':
+                    return False
+            except (IPControlError, TypeError):
+                pass
+
+        if self.tv is None:
+            return False
+        try:
+            device_info = await self.tv._get_device_info()
+            return device_info.get("device", {}).get("PowerState") == "on"
+        except Exception:
+            return False
+
+    def _replace_art_token(self, token: bytes) -> None:
+        """Atomically install a replacement Art token."""
+        self.token_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=self.token_file.parent,
+                prefix=self.token_file.name + ".replace-",
+                delete=False,
+            ) as temporary:
+                temporary.write(token)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                temporary_path = Path(temporary.name)
+            temporary_path.replace(self.token_file)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    async def _refresh_art_token_once(self) -> bool:
+        """Try one tokenless pairing request without removing the saved token."""
+        if not self.token_file.exists():
+            logger.warning(f"No saved Art token to refresh for TV {self.tv_ip}")
+            return False
+
+        await self.close()
+        self.tv = None
+
+        # Pair into an isolated temporary path. The working token remains on
+        # disk throughout, so a cancellation, process crash, or container
+        # restart cannot turn a guarded refresh into lost authorization.
+        with tempfile.TemporaryDirectory(
+            dir=self.token_file.parent,
+            prefix=self.token_file.name + ".refresh-",
+        ) as refresh_dir:
+            refresh_token_file = Path(refresh_dir) / "token.txt"
+
+            logger.warning(
+                f"Saved Art token was not accepted by TV {self.tv_ip}; "
+                "approve the next TV prompt to refresh it"
+            )
+            for refresh_attempt in (1, 2):
+                started = time.monotonic()
+                try:
+                    await asyncio.to_thread(
+                        self._pair_via_remote_channel, refresh_token_file
+                    )
+                except Exception as exc:
+                    elapsed = time.monotonic() - started
+                    event = ""
+                    if exc.args and isinstance(exc.args[0], dict):
+                        event = exc.args[0].get("event", "")
+                    if (
+                        refresh_attempt == 1
+                        and event == "ms.channel.timeOut"
+                        and elapsed < FAST_PAIRING_TIMEOUT_THRESHOLD
+                    ):
+                        # Some 2025 Frames display the approval prompt but close the
+                        # requesting socket in under a second — too quickly for a
+                        # person to respond. Give approval time to register, then
+                        # make exactly one more tokenless request. This is separate
+                        # from normal first-pairing's multi-attempt loop so a stale
+                        # token cannot create a stream of prompts.
+                        logger.info(
+                            f"TV {self.tv_ip} closed the Art pairing request after "
+                            f"{elapsed:.2f}s; waiting {PAIRING_RETRY_DELAY:g}s for "
+                            "approval before one final refresh attempt"
+                        )
+                        await asyncio.sleep(PAIRING_RETRY_DELAY)
+                        continue
+                    logger.warning(f"Guarded Art token refresh failed for TV {self.tv_ip}: {exc}")
+                break
+
+            try:
+                replacement_token = refresh_token_file.read_bytes()
+            except OSError:
+                replacement_token = b""
+
+            if replacement_token.strip():
+                try:
+                    self._replace_art_token(replacement_token)
+                except OSError as exc:
+                    logger.error(
+                        f"Replacement Art token was received but could not be saved "
+                        f"for TV {self.tv_ip}: {exc}"
+                    )
+                    return False
+                logger.info(f"Replacement Art token received for TV {self.tv_ip}; continuing")
+                await asyncio.sleep(2)
+                return True
+
+        logger.warning(
+            f"Guarded Art token refresh was not approved for TV {self.tv_ip}; "
+            "kept the existing token"
+        )
         return False
 
     async def _bounded_art_call(self, make_coro, timeout: float) -> Any:
@@ -480,7 +850,7 @@ class TVArtworkSync:
         except (asyncio.TimeoutError, OSError):
             return False
 
-    def _pair_via_remote_channel(self) -> None:
+    def _pair_via_remote_channel(self, token_file: Optional[Path] = None) -> None:
         """
         Open the remote-control channel to trigger pairing and capture the token.
 
@@ -489,26 +859,26 @@ class TVArtworkSync:
         to the token file. The art channel does *not* — its connect payload only
         carries the client list, so no token is ever saved.
 
-        Upstream only opens this channel when the TV reports model year >= 24
-        ("initialize token now for 2024+ tv's"), which leaves older sets unable to
-        pair at all: the art channel connects fine, the user approves a prompt,
-        and nothing is ever written. Opening it here regardless of model year is
-        what makes first-time pairing work on pre-2024 TVs.
+        Use the upstream base connection rather than SamsungTVWS itself. The
+        high-level constructor performs a hidden REST model probe and, on 2024+
+        TVs, silently calls open() once during construction. Calling open() here
+        afterward then creates two pairing windows, while the constructor hides
+        the first failure; two 30-second socket waits can look like one attempt
+        hung for over a minute. The base connection has the same remote endpoint
+        and token handling but opens exactly once when explicitly requested.
 
         Blocking (websocket-client), so call it via asyncio.to_thread.
         """
-        remote = SamsungTVWS(
+        pairing_token_file = token_file or self.token_file
+        remote = SamsungTVWSConnection(
             host=self.tv_ip,
+            endpoint=REMOTE_ENDPOINT,
             port=8002,
-            token_file=str(self.token_file),
+            token_file=str(pairing_token_file),
             timeout=AUTH_TIMEOUT,
             name=CLIENT_NAME,
         )
         try:
-            if self.token_file.exists():
-                # Constructing the client already paired us: upstream does that
-                # itself for model year >= 24. No need to open a second channel.
-                return
             # Blocks until the user approves on the TV (or the timeout expires).
             remote.open()
         finally:
@@ -546,31 +916,6 @@ class TVArtworkSync:
                     f"(remote channel) failed: {e}"
                 )
 
-            if not self.token_file.exists():
-                # Fall back to opening the art channel. This is what earlier
-                # versions relied on; keep it so any TV that does issue a token
-                # there still pairs.
-                try:
-                    self.tv = await asyncio.to_thread(
-                        SamsungTVAsyncArt,
-                        host=self.tv_ip,
-                        port=8002,
-                        token_file=str(self.token_file),
-                        timeout=AUTH_TIMEOUT,
-                        name=CLIENT_NAME
-                    )
-                    try:
-                        # Bound the wait: upstream's async open() blocks on recv()
-                        # indefinitely if the TV never sends ms.channel.connect.
-                        await self._bounded_art_call(self.tv.get_artmode, AUTH_TIMEOUT)
-                    except Exception:
-                        pass  # Expected disconnect after token issuance — ignore
-                except Exception as e:
-                    logger.warning(
-                        f"Pairing attempt {pairing_attempt} for TV {self.tv_ip} "
-                        f"(art channel) failed: {e}"
-                    )
-
             if self.token_file.exists():
                 logger.info(f"Token received for TV {self.tv_ip}")
                 await asyncio.sleep(2)  # Let TV finalize before we reconnect
@@ -589,8 +934,13 @@ class TVArtworkSync:
         )
         return False
 
-    async def is_in_art_mode(self) -> bool:
-        """Check if the TV is currently in art mode (not being used for other content)"""
+    async def is_in_art_mode(self, *, require_positive: bool = False) -> bool:
+        """Check whether the TV is in Art Mode.
+
+        Artwork sync preserves the historical optimistic fallback when status is
+        unavailable. Destructive actions pass require_positive=True and fail
+        closed unless the TV explicitly reports Art Mode on.
+        """
         try:
             # Read device info ourselves rather than calling tv.on(). Upstream's
             # _get_device_info() swallows every exception and returns {}, and on()
@@ -602,17 +952,32 @@ class TVArtworkSync:
             if not device_info:
                 logger.warning(
                     f"Could not read device info for TV {self.tv_ip} (REST call failed "
-                    f"or returned nothing) — assuming it is available and syncing anyway"
+                    f"or returned nothing)"
                 )
-                return True
+                if require_positive:
+                    return self.last_art_mode_status == 'on'
+                return not require_positive
 
             power_state = device_info.get("device", {}).get("PowerState", "unknown")
-            if power_state != "on":
+            device = device_info.get("device", {})
+            if mac := device.get("wifiMac") or device.get("networkMac"):
+                self._save_mac(mac)
+            # 2025 Frames can report REST PowerState=standby while visibly in
+            # Art Mode. When paired, powerControl is authoritative: Art Mode
+            # reports powerOn and true standby reports powerOff.
+            semantic_power = None
+            if self.ip_control.paired:
+                try:
+                    semantic_power = await self.ip_control.get_power_state()
+                except IPControlError as e:
+                    logger.debug(f"IP Control power-state read failed for TV {self.tv_ip}: {e}")
+            if semantic_power == 'powerOff' or (semantic_power is None and power_state != "on"):
                 logger.info(f"Skipping TV {self.tv_ip}: PowerState={power_state}")
                 return False
 
             # Check if TV is in art mode
             art_mode_status = await self.tv.get_artmode()
+            self.last_art_mode_status = str(art_mode_status).lower()
             is_art_mode = art_mode_status == 'on'
 
             if not is_art_mode:
@@ -628,9 +993,9 @@ class TVArtworkSync:
 
         except Exception as e:
             logger.debug(f"Could not determine art mode status for TV {self.tv_ip}: {e}")
-            # If we can't determine the state, assume it's safe to sync
-            # (this preserves backward-compatible behavior)
-            return True
+            if require_positive:
+                return self.last_art_mode_status == 'on'
+            return not require_positive
 
     async def get_local_images(self) -> Set[str]:
         """Get list of image files from local directory"""
@@ -860,8 +1225,52 @@ class TVArtworkSync:
             logger.info(f"[DRY RUN] Would turn off TV {self.tv_ip}")
             return True
 
+        logger.info(f"Turning off TV {self.tv_ip}")
+
+        # Preferred path: explicit hardware power-off. Unlike KEY_POWER, this
+        # does not confuse normal viewing, Art Mode and true standby.
+        if self.ip_control.paired:
+            try:
+                result = await self.ip_control.power_off()
+                if result not in ('powerOff', 'unknown'):
+                    logger.warning(f"Unexpected IP Control power-off response for TV {self.tv_ip}: {result}")
+                # A Frame can keep its REST/IP stack alive in standby. The
+                # semantic power getter is therefore the verification source.
+                await asyncio.sleep(POWER_OFF_VERIFY_DELAY)
+                try:
+                    state = await self.ip_control.get_power_state()
+                except IPControlTransportError:
+                    state = 'powerOff'  # Older sets disappear from the network.
+                if state == 'powerOff':
+                    logger.info(f"Successfully turned off TV {self.tv_ip} via IP Control")
+                    return True
+                logger.warning(f"TV {self.tv_ip} reports {state} after IP Control power-off")
+                return False
+            except IPControlAuthError as e:
+                logger.warning(
+                    f"IP Control token rejected for TV {self.tv_ip}: {e}; "
+                    "authorization will be requested automatically during a later "
+                    "sync while the TV is in normal viewing"
+                )
+                return False
+            except IPControlTransportError as e:
+                logger.warning(f"IP Control power-off failed for TV {self.tv_ip}: {e}; falling back to KEY_POWER hold")
+            except IPControlError as e:
+                logger.warning(
+                    f"IP Control power-off failed for TV {self.tv_ip}: {e}; "
+                    "not using KEY_POWER because the failure was not a network outage"
+                )
+                return False
+        elif power_control_configured():
+            logger.warning(
+                f"Cannot reliably auto-off TV {self.tv_ip}: IP Control is not paired. "
+                "Authorization will be requested automatically while the TV is in "
+                "normal viewing; not using KEY_POWER because it may only exit Art Mode."
+            )
+            return False
+
         try:
-            logger.info(f"Turning off TV {self.tv_ip}")
+            logger.info(f"Using legacy KEY_POWER hold fallback for TV {self.tv_ip}")
 
             # The art API uses a different websocket endpoint and can't send
             # remote keys, so we need a separate remote control connection
@@ -895,6 +1304,84 @@ class TVArtworkSync:
 
         except Exception as e:
             logger.warning(f"Could not turn off TV {self.tv_ip}: {e}")
+            return False
+
+    async def turn_on(self) -> bool:
+        """Power on a fully-off TV, preferring explicit IP Control."""
+        self.auto_started = False
+        if DRY_RUN:
+            logger.info(f"[DRY RUN] Would turn on TV {self.tv_ip}")
+            self.auto_started = True
+            return True
+
+        if not self.ip_control.paired:
+            logger.warning(
+                f"Cannot reliably auto-on TV {self.tv_ip}: IP Control is not paired. "
+                "Turn it on normally once; authorization will be requested "
+                "automatically while it is in normal viewing."
+            )
+            return False
+
+        try:
+            if await self.ip_control.get_power_state() == 'powerOn':
+                logger.debug(f"TV {self.tv_ip} is already powered on")
+                return True
+        except IPControlAuthError as e:
+            logger.warning(f"IP Control token rejected for TV {self.tv_ip}: {e}")
+            return False
+        except IPControlTransportError:
+            pass  # Deep standby may temporarily close port 1516.
+        except IPControlError as e:
+            logger.debug(f"Could not read power state for TV {self.tv_ip}: {e}")
+
+        try:
+            result = await self.ip_control.power_on()
+            if result not in ('powerOn', 'unknown'):
+                logger.warning(f"Unexpected IP Control power-on response for TV {self.tv_ip}: {result}")
+        except IPControlAuthError as e:
+            logger.warning(f"IP Control token rejected for TV {self.tv_ip}: {e}")
+            return False
+        except IPControlTransportError as first_error:
+            # Most tested 2024/2025 Frames keep IP Control reachable in standby,
+            # but retain WOL for models/network settings that do not.
+            logger.info(f"Direct IP power-on could not reach TV {self.tv_ip} ({first_error}); trying WOL fallback")
+            if not await self._send_wol():
+                return False
+            if not await self._wait_for_port(self.ip_control.port, POWER_ON_VERIFY_TIMEOUT):
+                logger.warning(f"TV {self.tv_ip} did not expose IP Control after WOL")
+                return False
+            try:
+                await self.ip_control.power_on()
+            except IPControlError as e:
+                logger.warning(f"IP Control power-on after WOL failed for TV {self.tv_ip}: {e}")
+                return False
+        except IPControlError as e:
+            logger.warning(f"IP Control power-on failed for TV {self.tv_ip}: {e}")
+            return False
+
+        if await self._wait_for_port(8002, POWER_ON_VERIFY_TIMEOUT):
+            self.auto_started = True
+            logger.info(f"Successfully powered on TV {self.tv_ip} via IP Control")
+            return True
+        logger.warning(f"TV {self.tv_ip} did not become reachable after power-on")
+        return False
+
+    async def ensure_art_mode(self) -> bool:
+        """Leave an already-on Art Mode untouched; otherwise enter it via WS."""
+        try:
+            if await self.tv.get_artmode() == 'on':
+                return True
+            logger.info(f"TV {self.tv_ip} woke into normal viewing; enabling Art Mode")
+            await self.tv.set_artmode('on')
+            for _ in range(10):
+                await asyncio.sleep(1)
+                if await self.tv.get_artmode() == 'on':
+                    logger.info(f"TV {self.tv_ip} entered Art Mode")
+                    return True
+            logger.warning(f"TV {self.tv_ip} did not enter Art Mode after power-on")
+            return False
+        except Exception as e:
+            logger.warning(f"Could not enable Art Mode on TV {self.tv_ip}: {e}")
             return False
 
     async def sync(self, local_images: Set[str] = None) -> bool:
@@ -1094,6 +1581,15 @@ class TVArtworkSync:
 
 async def wait_until_next_sync(tvs_to_keepalive: List['TVArtworkSync']) -> None:
     """Sleep until the next sync interval, pinging any provided TVs to keep their channels open."""
+    if tvs_to_keepalive:
+        logger.info(
+            f"Keeping connections alive for {SYNC_INTERVAL_MINUTES} minute(s) "
+            "until next sync..."
+        )
+    else:
+        logger.info(
+            f"Waiting {SYNC_INTERVAL_MINUTES} minute(s) until next sync..."
+        )
     sync_interval_seconds = SYNC_INTERVAL_MINUTES * 60
     elapsed = 0
     while elapsed < sync_interval_seconds:
@@ -1123,6 +1619,45 @@ async def sync_all_tvs() -> None:
 
     tv_syncs = [TVArtworkSync(ip) for ip in TV_IPS]
 
+    auto_off_window = is_within_auto_off_window()
+    auto_on_attempt = should_attempt_auto_on()
+    if auto_on_attempt and auto_off_window:
+        logger.warning("Auto-on time falls within the auto-off window; auto-off takes precedence")
+        auto_on_attempt = False
+
+    # Power-on must run before the normal art connection: fully-off TVs cannot
+    # pass connect(), so waiting until after it would make AUTO_ON_TIME inert.
+    if auto_on_attempt:
+        logger.info(f"Auto-on time reached ({AUTO_ON_TIME}); making today's single power-on attempt")
+        await asyncio.gather(*[tv.turn_on() for tv in tv_syncs])
+
+    # Do not put a barrier between connecting and powering off. A TV awaiting
+    # first-time pairing can spend several minutes in _acquire_token(); healthy
+    # TVs must still be turned off as soon as their own connection is ready.
+    if auto_off_window:
+        grace_display = int(AUTO_OFF_GRACE_HOURS) if AUTO_OFF_GRACE_HOURS == int(AUTO_OFF_GRACE_HOURS) else AUTO_OFF_GRACE_HOURS
+        logger.info(
+            f"Within auto-off window ({AUTO_OFF_TIME} + {grace_display}h grace); "
+            "processing each TV independently"
+        )
+
+        async def connect_and_turn_off(tv_sync: TVArtworkSync) -> bool:
+            try:
+                if not await tv_sync.connect():
+                    return False
+                if not await tv_sync.is_in_art_mode(require_positive=True):
+                    logger.info(
+                        f"Skipping TV {tv_sync.tv_ip} - not in art mode (may be in use)"
+                    )
+                    return False
+                return await tv_sync.turn_off()
+            finally:
+                await tv_sync.close()
+
+        await asyncio.gather(*[connect_and_turn_off(tv) for tv in tv_syncs])
+        await wait_until_next_sync([])
+        return
+
     connect_results = await asyncio.gather(*[tv.connect() for tv in tv_syncs])
     connected_tvs = [tv for tv, ok in zip(tv_syncs, connect_results) if ok]
 
@@ -1136,6 +1671,11 @@ async def sync_all_tvs() -> None:
     for tv_sync in connected_tvs:
         if await tv_sync.is_in_art_mode():
             tvs_in_art_mode.append(tv_sync)
+        elif auto_on_attempt and tv_sync.auto_started and await tv_sync.ensure_art_mode():
+            # A TV may resume to its last input instead of Art Mode. Scheduled
+            # startup always converges to Art Mode, but never touches an
+            # already-on TV outside the auto-on window.
+            tvs_in_art_mode.append(tv_sync)
         else:
             logger.info(f"Skipping TV {tv_sync.tv_ip} - not in art mode (may be in use)")
 
@@ -1145,22 +1685,9 @@ async def sync_all_tvs() -> None:
         await wait_until_next_sync([])
         return
 
-    # In the auto-off window, skip the artwork sync and go straight to powering
-    # off — there's no point re-applying slideshow/brightness/image selection on
-    # a TV we're about to turn off. We also don't keep connections alive
-    # afterwards, since there's nothing to keep open on a powered-off TV.
-    if is_within_auto_off_window():
-        grace_display = int(AUTO_OFF_GRACE_HOURS) if AUTO_OFF_GRACE_HOURS == int(AUTO_OFF_GRACE_HOURS) else AUTO_OFF_GRACE_HOURS
-        logger.info(f"Within auto-off window ({AUTO_OFF_TIME} + {grace_display}h grace), turning off {len(tvs_in_art_mode)} TV(s) in art mode")
-        await asyncio.gather(*[tv_sync.turn_off() for tv_sync in tvs_in_art_mode])
-        await asyncio.gather(*[tv.close() for tv in tv_syncs])
-        await wait_until_next_sync([])
-        return
-
     local_images = await tvs_in_art_mode[0].get_local_images()
     await asyncio.gather(*[tv.sync(local_images) for tv in tvs_in_art_mode])
 
-    logger.info(f"Keeping connections alive for {SYNC_INTERVAL_MINUTES} minute(s) until next sync...")
     await wait_until_next_sync(tvs_in_art_mode)
 
     await asyncio.gather(*[tv.close() for tv in tv_syncs])
@@ -1222,6 +1749,15 @@ async def main() -> None:
             await asyncio.sleep(SYNC_INTERVAL_MINUTES * 60)
 
 
+async def pair_ip_control(tv_ip: str) -> int:
+    """Pair one explicitly selected TV; never prompt several rooms at once."""
+    if tv_ip not in TV_IPS:
+        logger.error(f"{tv_ip} is not present in TV_IPS")
+        return 2
+    tv = TVArtworkSync(tv_ip)
+    return 0 if await tv.pair_ip_control() else 1
+
+
 if __name__ == '__main__':
     # Check for command-line arguments
     if len(sys.argv) > 1:
@@ -1248,8 +1784,14 @@ if __name__ == '__main__':
             # Enable dry run mode
             DRY_RUN = True
             logger.info("=" * 60)
-            logger.info("DRY RUN MODE - No changes will be made to TVs")
+            logger.info("DRY RUN MODE - No artwork, settings, or power changes will be made")
+            logger.info("Connection authorization may still prompt and save missing tokens")
             logger.info("=" * 60)
+        elif sys.argv[1] == '--pair-ip-control':
+            if len(sys.argv) != 3:
+                logger.error("Usage: sync_artwork.py --pair-ip-control <TV_IP>")
+                sys.exit(2)
+            sys.exit(asyncio.run(pair_ip_control(sys.argv[2])))
 
     # Normal operation mode
     try:

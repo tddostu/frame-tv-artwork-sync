@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   frame-tv-sync:
     image: turley/frame-tv-artwork-sync
@@ -46,6 +44,12 @@ services:
       # Requires LOCATION_TIMEZONE to be set.
       # AUTO_OFF_TIME: "22:00"        # Time to turn off (24-hour format)
       # AUTO_OFF_GRACE_HOURS: "2"     # Hours after AUTO_OFF_TIME to keep trying
+
+      # Optional: Auto-On Control
+      # For a fresh install, leave the TV in normal TV/HDMI viewing and approve
+      # both prompts. IP Control approval is automatic but requires normal viewing.
+      # AUTO_ON_TIME: "07:00"
+      # WOL_BROADCAST_ADDRESS: "255.255.255.255"  # Fallback when deep standby closes IP Control
     volumes:
       # Map your local artwork folder to /artwork in container
       - ./artwork:/artwork
