@@ -14,7 +14,7 @@ import logging
 import threading
 from concurrent import futures
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from tv_control import (
@@ -92,16 +92,29 @@ class _ControlHandler(BaseHTTPRequestHandler):
             if action == "status" and method == "GET":
                 self._dispatch(ip, "status")
                 return
-            # Plain-text "1"/"0" for simple HTTP contact-sensor plugins.
+            # Plain-text flags for simple HTTP sensor plugins. /art is the
+            # intuitive boolean; /contact is the HomeKit ContactSensorState
+            # value (0 = closed, 1 = open), which is what the common
+            # homebridge-http-contact-sensor plugin feeds straight to HomeKit.
             if action == "art" and method == "GET":
-                self._dispatch(ip, "status", plain_art=True)
+                self._dispatch(ip, "status", text=("1", "0"))
+                return
+            if action == "contact" and method == "GET":
+                self._dispatch(ip, "status", text=("0", "1"))
                 return
             if action in ("on", "off") and method == "POST":
                 self._dispatch(ip, action)
                 return
         self._respond(404, {"error": "not found"})
 
-    def _dispatch(self, ip: str, action: str, *, plain_art: bool = False) -> None:
+    def _dispatch(
+        self,
+        ip: str,
+        action: str,
+        *,
+        text: Optional[Tuple[str, str]] = None,
+    ) -> None:
+        """Dispatch a request. ``text`` is the (art, not-art) plain-text pair."""
         server = self.server
         assert isinstance(server, ControlHTTPServer)
         concurrent = asyncio.run_coroutine_threadsafe(
@@ -124,8 +137,10 @@ class _ControlHandler(BaseHTTPRequestHandler):
             logger.warning("control request failed for %s: %s", ip, exc)
             self._respond(500, {"error": "internal error"})
         else:
-            if plain_art:
-                self._respond_text(200, "1" if result.get("state") == "art" else "0")
+            if text is not None:
+                art_value, other_value = text
+                value = art_value if result.get("state") == "art" else other_value
+                self._respond_text(200, value)
             else:
                 self._respond(200, result)
 

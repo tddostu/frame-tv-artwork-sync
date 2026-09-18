@@ -19,6 +19,7 @@ never opens a second Art connection that could knock the sync service off the TV
 | `GET` | `/health` | `{"status":"ok"}` |
 | `GET` | `/tv/<ip>/status` | `{"ip":"<ip>","state":"art"\|"on"\|"off"\|"unknown"}` |
 | `GET` | `/tv/<ip>/art` | `1` when in Art Mode, otherwise `0` (plain text) |
+| `GET` | `/tv/<ip>/contact` | HomeKit contact value: `0` (closed) in Art Mode, `1` (open) otherwise |
 | `POST` | `/tv/<ip>/on` | Wake to Art Mode, or no-op if already on |
 | `POST` | `/tv/<ip>/off` | Power off if in Art Mode |
 
@@ -134,13 +135,14 @@ power-on plus the Art Mode transition can take longer.
   "accessory": "ContactSensor",
   "name": "Frame TV Art Mode",
   "pollInterval": 15000,
-  "statusUrl": "http://127.0.0.1:8080/tv/192.168.1.100/art"
+  "statusUrl": "http://127.0.0.1:8080/tv/192.168.1.100/contact"
 }
 ```
 
-The sensor is closed (`1`) while the TV is in Art Mode and open (`0`)
-otherwise. Together with the switch this distinguishes all three states: off,
-Art Mode, and content.
+Use `/contact`, not `/art`. HomeKit's `ContactSensorState` is `0` for closed and
+`1` for open, and this plugin passes the response body straight through. So the
+sensor reads closed while the TV is in Art Mode and open otherwise. Together
+with the switch this distinguishes all three states: off, Art Mode, and content.
 
 Add one switch and one sensor per TV, replacing `192.168.1.100` with each TV's
 address as configured in `TV_IPS`. The examples use the host-loopback address

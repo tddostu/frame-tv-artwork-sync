@@ -102,6 +102,22 @@ class ControlApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body, "0")
 
+    async def test_contact_endpoint_is_closed_in_art_mode(self):
+        self.control.results = {"status": {"ip": "192.0.2.10", "state": "art"}}
+        status, body = await asyncio.to_thread(
+            self._http_raw, "/tv/192.0.2.10/contact"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, "0")
+
+    async def test_contact_endpoint_is_open_for_content(self):
+        self.control.results = {"status": {"ip": "192.0.2.10", "state": "on"}}
+        status, body = await asyncio.to_thread(
+            self._http_raw, "/tv/192.0.2.10/contact"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, "1")
+
     async def test_on_routes_to_queue(self):
         self.control.results = {"on": {"ip": "192.0.2.10", "state": "art"}}
         status, body = await self._call("POST", "/tv/192.0.2.10/on")
