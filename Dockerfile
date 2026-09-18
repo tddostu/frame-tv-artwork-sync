@@ -15,6 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY sync_artwork.py .
 COPY samsung_ip_control.py .
 COPY solar_test_output.py .
+COPY tv_control.py .
+COPY control_api.py .
 
 # Create directories for artwork and tokens
 RUN mkdir -p /artwork /tokens

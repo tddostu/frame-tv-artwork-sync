@@ -14,6 +14,7 @@ TV's slideshow settings, and leaves TVs alone while they are being watched.
 - Supports fixed or sunlight-based Art Mode brightness
 - Can remove only its own missing artwork, or optionally enforce an exact mirror
 - Optionally powers TVs on into Art Mode and turns them off only when safe
+- Optional local HTTP control API for Homebridge and other controllers
 - Keeps tokens in a persistent volume and handles pairing in the normal loop
 
 ## Quick start
@@ -140,6 +141,7 @@ For interactive tests against a real TV, see [Diagnostics](diagnostics/README.md
 ## Documentation
 
 - [Configuration](docs/configuration.md)
+- [Homebridge control](docs/homebridge.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Interactive diagnostics](diagnostics/README.md)
 

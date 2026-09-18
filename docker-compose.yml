@@ -1,6 +1,7 @@
 services:
   frame-tv-sync:
-    image: turley/frame-tv-artwork-sync
+    build: .
+    image: frame-tv-artwork-sync:local
     restart: unless-stopped
     environment:
       # Comma-separated list of TV IP addresses
@@ -38,6 +39,13 @@ services:
       # Optional: Client name shown in the TV's authorized devices list
       # CLIENT_NAME: "FrameTVArtworkSync"
 
+      # Optional: local HTTP control API for Homebridge power on/off.
+      # Deliberately not published on the host; reachable only on the
+      # "frame-control" Docker network below. Add that network to Homebridge
+      # (as external) and target http://frame-tv-sync:8080/tv/<ip>/...
+      CONTROL_API_ENABLED: "true"
+      CONTROL_API_PORT: "8080"
+
       # Optional: Auto-Off Control
       # Turn off TVs at a specific time, but only when in art mode.
       # TVs being used for other content (e.g., HDMI) are left alone.
@@ -56,3 +64,11 @@ services:
 
       # Persist TV authentication tokens
       - ./tokens:/tokens
+    networks:
+      - frame-control
+
+# Shared with Homebridge. The fixed name lets a separate Compose project join
+# it as an external network. Create it once with: docker network create frame-control
+networks:
+  frame-control:
+    name: frame-control

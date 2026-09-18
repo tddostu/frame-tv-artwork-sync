@@ -32,6 +32,14 @@ from samsung_ip_control import (
     IPControlTransportError,
     SamsungIPControl,
 )
+from tv_control import (
+    ControlConflict,
+    ControlError,
+    ControlNotFound,
+    ControlQueue,
+    ControlRequest,
+    ControlUnavailable,
+)
 
 # Track websockets created during a channel handshake so we can close orphans.
 #
@@ -158,6 +166,14 @@ REMOVE_UNKNOWN_IMAGES = os.getenv('REMOVE_UNKNOWN_IMAGES', '').lower() in ('true
 # Client name sent to the TV during WebSocket handshake
 CLIENT_NAME = os.getenv('CLIENT_NAME', 'FrameTVArtworkSync')
 
+# Optional local HTTP control API (Homebridge power on/off). It is intentionally
+# not published to the host: expose it only on a shared Docker network.
+CONTROL_API_ENABLED = os.getenv('CONTROL_API_ENABLED', '').lower() in ('true', '1', 'yes')
+CONTROL_API_HOST = os.getenv('CONTROL_API_HOST', '0.0.0.0')
+CONTROL_API_PORT = int(os.getenv('CONTROL_API_PORT', '8080'))
+# Must exceed the slowest guarded action (power-on verify, art-mode wait).
+CONTROL_API_TIMEOUT = float(os.getenv('CONTROL_API_TIMEOUT', '60'))
+
 # Optional auto-off settings (turn off TVs at a specific time when in art mode)
 AUTO_OFF_TIME = os.getenv('AUTO_OFF_TIME', '')  # 24-hour format, e.g., "22:00"
 AUTO_OFF_GRACE_HOURS = float(os.getenv('AUTO_OFF_GRACE_HOURS', '2'))  # Hours after AUTO_OFF_TIME to keep trying
@@ -211,6 +227,10 @@ UPLOAD_ATTEMPTS = 2
 POWER_OFF_VERIFY_DELAY = 5.0  # Seconds to wait after a power-off before checking it took effect
 POWER_ON_VERIFY_TIMEOUT = float(os.getenv('POWER_ON_VERIFY_TIMEOUT', '30.0'))
 _AUTO_ON_LAST_ATTEMPT: Optional[datetime.date] = None
+
+# Set by main() when the control API is enabled. When None, external power
+# requests are not accepted and the wait loop behaves exactly as before.
+_CONTROL_QUEUE: Optional[ControlQueue] = None
 
 
 def power_control_configured() -> bool:
@@ -1306,6 +1326,20 @@ class TVArtworkSync:
             logger.warning(f"Could not turn off TV {self.tv_ip}: {e}")
             return False
 
+    async def safe_turn_off(self) -> bool:
+        """Power off only when the TV is positively in Art Mode.
+
+        Used by external control requests; mirrors the guard the auto-off
+        schedule applies before calling turn_off(), so neither disturbs a TV
+        that is being watched.
+        """
+        if not await self.is_in_art_mode(require_positive=True):
+            logger.info(
+                f"Refusing to turn off TV {self.tv_ip}: not in art mode (may be in use)"
+            )
+            return False
+        return await self.turn_off()
+
     async def turn_on(self) -> bool:
         """Power on a fully-off TV, preferring explicit IP Control."""
         self.auto_started = False
@@ -1579,6 +1613,127 @@ class TVArtworkSync:
                 pass
 
 
+async def process_control_requests(tvs_to_keepalive: List['TVArtworkSync']) -> None:
+    """Run queued external control requests on the sync loop's connections."""
+    queue = _CONTROL_QUEUE
+    if queue is None:
+        return
+    for request in queue.drain():
+        if request.future.done():
+            # The HTTP caller already gave up (timeout or disconnect).
+            continue
+        try:
+            result = await execute_control_request(request, tvs_to_keepalive)
+        except ControlError as exc:
+            if not request.future.done():
+                request.future.set_exception(exc)
+        except Exception as exc:  # noqa: BLE001 - never leave a caller hanging
+            if not request.future.done():
+                request.future.set_exception(
+                    ControlUnavailable(f"control request failed for {request.ip}: {exc}")
+                )
+        else:
+            # The caller may have timed out and cancelled the future while the
+            # action was running.
+            if not request.future.done():
+                request.future.set_result(result)
+
+
+async def execute_control_request(
+    request: ControlRequest, tvs_to_keepalive: List['TVArtworkSync']
+) -> Dict[str, Any]:
+    """Dispatch one control request to a live or temporary TV client."""
+    ip = request.ip
+    if ip not in TV_IPS:
+        raise ControlNotFound(f"TV {ip} is not configured in TV_IPS")
+    tv_sync = next((tv for tv in tvs_to_keepalive if tv.tv_ip == ip), None)
+    if request.action == 'status':
+        return await _control_status(ip, tv_sync)
+    if request.action == 'on':
+        return await _control_on(ip, tv_sync)
+    return await _control_off(ip, tv_sync)
+
+
+async def _control_status(ip: str, tv_sync: Optional['TVArtworkSync']) -> Dict[str, Any]:
+    """Report off / art / on from IP Control plus the cached art status."""
+    owned = tv_sync is None
+    if tv_sync is None:
+        tv_sync = TVArtworkSync(ip)
+    try:
+        power = None
+        if tv_sync.ip_control.paired:
+            try:
+                power = await tv_sync.ip_control.get_power_state()
+            except IPControlError:
+                power = None
+        if power == 'powerOff':
+            state = 'off'
+        elif power == 'powerOn':
+            state = 'art' if tv_sync.last_art_mode_status == 'on' else 'on'
+        elif tv_sync.last_art_mode_status == 'on':
+            state = 'art'
+        else:
+            state = 'unknown'
+        return {"ip": ip, "state": state}
+    finally:
+        if owned:
+            await tv_sync.close()
+
+
+async def _control_on(ip: str, tv_sync: Optional['TVArtworkSync']) -> Dict[str, Any]:
+    """Wake an off TV into Art Mode; leave an already-on TV untouched."""
+    owned = tv_sync is None
+    if tv_sync is None:
+        tv_sync = TVArtworkSync(ip)
+    try:
+        if not await tv_sync.turn_on():
+            raise ControlUnavailable(f"TV {ip} could not be powered on")
+        if not tv_sync.auto_started:
+            # Already on: do not disturb Art Mode or whichever input is active.
+            state = 'art' if tv_sync.last_art_mode_status == 'on' else 'on'
+            return {"ip": ip, "state": state}
+        if tv_sync.tv is None and not await tv_sync.connect():
+            raise ControlUnavailable(f"TV {ip} did not become reachable after power-on")
+        if not await tv_sync.ensure_art_mode():
+            raise ControlUnavailable(f"TV {ip} did not enter Art Mode")
+        return {"ip": ip, "state": "art"}
+    finally:
+        if owned:
+            await tv_sync.close()
+
+
+async def _control_off(ip: str, tv_sync: Optional['TVArtworkSync']) -> Dict[str, Any]:
+    """Refuse to power off a TV that is not positively in Art Mode."""
+    owned = tv_sync is None
+    if tv_sync is None:
+        tv_sync = TVArtworkSync(ip)
+    try:
+        if tv_sync.tv is None and not await tv_sync.connect():
+            # Unreachable. If IP Control confirms standby, the request is met.
+            if await _power_off_confirmed(tv_sync):
+                return {"ip": ip, "state": "off"}
+            raise ControlUnavailable(f"TV {ip} is unreachable")
+        if not await tv_sync.is_in_art_mode(require_positive=True):
+            raise ControlConflict(
+                f"TV {ip} is on but not in Art Mode; refusing to power off"
+            )
+        if not await tv_sync.turn_off():
+            raise ControlUnavailable(f"TV {ip} did not power off")
+        return {"ip": ip, "state": "off"}
+    finally:
+        if owned:
+            await tv_sync.close()
+
+
+async def _power_off_confirmed(tv_sync: 'TVArtworkSync') -> bool:
+    if not tv_sync.ip_control.paired:
+        return False
+    try:
+        return await tv_sync.ip_control.get_power_state() == 'powerOff'
+    except IPControlError:
+        return False
+
+
 async def wait_until_next_sync(tvs_to_keepalive: List['TVArtworkSync']) -> None:
     """Sleep until the next sync interval, pinging any provided TVs to keep their channels open."""
     if tvs_to_keepalive:
@@ -1594,7 +1749,15 @@ async def wait_until_next_sync(tvs_to_keepalive: List['TVArtworkSync']) -> None:
     elapsed = 0
     while elapsed < sync_interval_seconds:
         chunk = min(KEEPALIVE_INTERVAL, sync_interval_seconds - elapsed)
-        await asyncio.sleep(chunk)
+        if _CONTROL_QUEUE is not None:
+            # Wake early for an external power request instead of waiting out the
+            # keepalive chunk. An interrupted wait does not advance the sync
+            # clock, so the next scheduled sync still lands on time.
+            if await _CONTROL_QUEUE.wait(chunk):
+                await process_control_requests(tvs_to_keepalive)
+                continue
+        else:
+            await asyncio.sleep(chunk)
         elapsed += chunk
         if elapsed < sync_interval_seconds:
             for tv_sync in tvs_to_keepalive:
@@ -1602,7 +1765,9 @@ async def wait_until_next_sync(tvs_to_keepalive: List['TVArtworkSync']) -> None:
                     # get_artmode_status, not get_content_list — see the probe in
                     # _try_connect. Cheaper, and answered by TVs that ignore a
                     # null-category content list request.
-                    await tv_sync.tv.get_artmode()
+                    art_mode_status = await tv_sync.tv.get_artmode()
+                    # Keep the cached status fresh for the control API.
+                    tv_sync.last_art_mode_status = str(art_mode_status).lower()
                     logger.debug(f"Keepalive ping OK for TV {tv_sync.tv_ip}")
                 except Exception as e:
                     logger.debug(f"Keepalive ping failed for TV {tv_sync.tv_ip}: {e}")
@@ -1740,6 +1905,19 @@ async def main() -> None:
         sys.exit(1)
 
     check_token_dir_writable()
+
+    if CONTROL_API_ENABLED:
+        global _CONTROL_QUEUE
+        from control_api import start_control_server
+
+        _CONTROL_QUEUE = ControlQueue()
+        start_control_server(
+            _CONTROL_QUEUE,
+            asyncio.get_running_loop(),
+            CONTROL_API_HOST,
+            CONTROL_API_PORT,
+            CONTROL_API_TIMEOUT,
+        )
 
     while True:
         try:

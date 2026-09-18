@@ -156,6 +156,23 @@ permission is missing or rejected, or when the TV returns a protocol error,
 because some Frames interpret the key hold as leaving Art Mode for HDMI rather
 than powering off.
 
+## Local control API
+
+An optional HTTP API lets external controllers such as Homebridge power TVs on
+and off using the same guard as the schedule: On wakes only an off TV into Art
+Mode, and Off acts only when Art Mode is positively confirmed. The API runs
+inside the sync process, so it never opens a competing Art connection.
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `CONTROL_API_ENABLED` | Start the control API | `false` |
+| `CONTROL_API_HOST` | Bind address inside the container | `0.0.0.0` |
+| `CONTROL_API_PORT` | Listen port | `8080` |
+| `CONTROL_API_TIMEOUT` | Request timeout in seconds, covering power-on and Art Mode | `60` |
+
+Leave the port unpublished and expose it only on a shared Docker network. See
+[Homebridge control](homebridge.md) for endpoints and configuration.
+
 ## Connection tuning
 
 Defaults are appropriate for most installations.
