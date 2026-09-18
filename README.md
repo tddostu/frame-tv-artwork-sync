@@ -121,6 +121,27 @@ docker compose run --rm frame-tv-sync python sync_artwork.py --test-solar
 Instructions for running directly with Python are in
 [Configuration](docs/configuration.md#running-without-docker).
 
+## Custom image (GitHub Container Registry)
+
+This fork publishes its own image to GHCR via
+[`.github/workflows/ghcr-publish.yml`](.github/workflows/ghcr-publish.yml) on
+every push to `homebridge-control` and on `v*` tags. The compose file references:
+
+```
+ghcr.io/tddostu/frame-tv-artwork-sync:latest
+```
+
+The first publish creates a **private** package. Either make it public (Package
+settings → Change visibility) or authenticate on the Docker host:
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u tddostu --password-stdin
+```
+
+`GHCR_TOKEN` is a personal access token (classic) with at least `read:packages`.
+Compose then pulls the image automatically. To build from source instead,
+comment out `image:` in `docker-compose.yml` and uncomment `build: .`.
+
 ## Troubleshooting
 
 Start with [Troubleshooting](docs/troubleshooting.md), which covers pairing,

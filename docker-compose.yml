@@ -1,7 +1,11 @@
 services:
   frame-tv-sync:
-    build: .
-    image: frame-tv-artwork-sync:local
+    # Prebuilt from this fork on GitHub Container Registry. If the package is
+    # private, run `docker login ghcr.io` first (see README), or make the
+    # package public in the repo's package settings.
+    # To build locally instead, comment out `image:` and uncomment `build:`.
+    image: ghcr.io/tddostu/frame-tv-artwork-sync:latest
+    # build: .
     restart: unless-stopped
     environment:
       # Comma-separated list of TV IP addresses
