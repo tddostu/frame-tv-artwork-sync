@@ -44,9 +44,10 @@ services:
       # CLIENT_NAME: "FrameTVArtworkSync"
 
       # Optional: local HTTP control API for Homebridge power on/off.
-      # Deliberately not published on the host; reachable only on the
-      # "frame-control" Docker network below. Add that network to Homebridge
-      # (as external) and target http://frame-tv-sync:8080/tv/<ip>/...
+      # Published on the host loopback only (see `ports` below), so it is not
+      # exposed to the LAN. A host-networked Homebridge reaches it at
+      # http://127.0.0.1:8080/tv/<ip>/...  A bridge-networked Homebridge can
+      # instead join the "frame-control" network and use http://frame-tv-sync:8080
       CONTROL_API_ENABLED: "true"
       CONTROL_API_PORT: "8080"
 
@@ -62,6 +63,11 @@ services:
       # both prompts. IP Control approval is automatic but requires normal viewing.
       # AUTO_ON_TIME: "07:00"
       # WOL_BROADCAST_ADDRESS: "255.255.255.255"  # Fallback when deep standby closes IP Control
+    ports:
+      # Control API on the host loopback so a host-networked Homebridge
+      # (network_mode: host) can reach it without exposing it on the LAN.
+      # Drop the "127.0.0.1:" prefix to allow other hosts on the network.
+      - "127.0.0.1:8080:8080"
     volumes:
       # Map your local artwork folder to /artwork in container
       - ./artwork:/artwork
@@ -71,8 +77,10 @@ services:
     networks:
       - frame-control
 
-# Shared with Homebridge. The fixed name lets a separate Compose project join
-# it as an external network. Create it once with: docker network create frame-control
+# Only needed if Homebridge is bridge-networked and joins this network (see the
+# control API comment above). A host-networked Homebridge uses the published
+# loopback port instead, so this block can be removed. The fixed name lets a
+# separate Compose project join it as external: docker network create frame-control
 networks:
   frame-control:
     name: frame-control

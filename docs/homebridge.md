@@ -40,17 +40,35 @@ CONTROL_API_ENABLED: "true"
 CONTROL_API_PORT: "8080"
 ```
 
-Do **not** publish the port to the host. It is intended to be reachable only on
-a shared Docker network. Because the code is local, build the image:
+The supplied `docker-compose.yml` also publishes the API on the host loopback
+(`127.0.0.1:8080`), which is what a host-networked Homebridge uses; see below.
+Start the service:
 
 ```bash
 docker compose up -d --build
 ```
 
-## 2. Share a Docker network with Homebridge
+## 2. Let Homebridge reach the API
 
-The supplied compose file creates a network named `frame-control`. Join it from
-your Homebridge Compose project:
+Pick the option that matches how your Homebridge container is networked.
+
+### Homebridge with `network_mode: host`
+
+A host-networked container shares the host's network, so it cannot join a
+Docker network. Use the loopback publish, which the supplied compose already
+configures:
+
+```yaml
+ports:
+  - "127.0.0.1:8080:8080"
+```
+
+Homebridge then reaches the API at `http://127.0.0.1:8080`. Binding to
+`127.0.0.1` keeps it off the LAN.
+
+### Homebridge on a bridge network
+
+Join the shared `frame-control` network from your Homebridge Compose project:
 
 ```yaml
 services:
@@ -70,7 +88,7 @@ Create the network once (starting the sync service also creates it):
 docker network create frame-control
 ```
 
-You can then reach the service by name: `http://frame-tv-sync:8080`.
+Then reach the service by name: `http://frame-tv-sync:8080`.
 
 ## 3. Configure Homebridge
 
@@ -90,17 +108,17 @@ npm install -g homebridge-http-switch homebridge-http-contact-sensor
   "pullInterval": 15000,
   "statusPattern": "\"state\":\\s*\"(art|on)\"",
   "onUrl": {
-    "url": "http://frame-tv-sync:8080/tv/192.168.1.100/on",
+    "url": "http://127.0.0.1:8080/tv/192.168.1.100/on",
     "method": "POST",
     "requestTimeout": 60000
   },
   "offUrl": {
-    "url": "http://frame-tv-sync:8080/tv/192.168.1.100/off",
+    "url": "http://127.0.0.1:8080/tv/192.168.1.100/off",
     "method": "POST",
     "requestTimeout": 60000
   },
   "statusUrl": {
-    "url": "http://frame-tv-sync:8080/tv/192.168.1.100/status",
+    "url": "http://127.0.0.1:8080/tv/192.168.1.100/status",
     "method": "GET"
   }
 }
@@ -116,7 +134,7 @@ power-on plus the Art Mode transition can take longer.
   "accessory": "ContactSensor",
   "name": "Frame TV Art Mode",
   "pollInterval": 15000,
-  "statusUrl": "http://frame-tv-sync:8080/tv/192.168.1.100/art"
+  "statusUrl": "http://127.0.0.1:8080/tv/192.168.1.100/art"
 }
 ```
 
@@ -125,11 +143,19 @@ otherwise. Together with the switch this distinguishes all three states: off,
 Art Mode, and content.
 
 Add one switch and one sensor per TV, replacing `192.168.1.100` with each TV's
-address as configured in `TV_IPS`.
+address as configured in `TV_IPS`. The examples use the host-loopback address
+for a host-networked Homebridge; a bridge-networked Homebridge should swap
+`127.0.0.1` for `frame-tv-sync`.
 
 ## Testing
 
-From another container on the same network:
+From the Docker host (the same address a host-networked Homebridge uses):
+
+```bash
+curl -s http://127.0.0.1:8080/tv/192.168.1.100/status
+```
+
+From a bridge-network container:
 
 ```bash
 docker run --rm --network frame-control curlimages/curl -s \
