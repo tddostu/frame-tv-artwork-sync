@@ -1745,21 +1745,26 @@ async def wait_until_next_sync(tvs_to_keepalive: List['TVArtworkSync']) -> None:
         logger.info(
             f"Waiting {SYNC_INTERVAL_MINUTES} minute(s) until next sync..."
         )
-    sync_interval_seconds = SYNC_INTERVAL_MINUTES * 60
-    elapsed = 0
-    while elapsed < sync_interval_seconds:
-        chunk = min(KEEPALIVE_INTERVAL, sync_interval_seconds - elapsed)
+    # Track the next sync by wall-clock time rather than by summing completed
+    # sleeps. A control request wakes the wait early, so counting chunks would
+    # let a steady stream of Homebridge polls (faster than KEEPALIVE_INTERVAL)
+    # postpone the next sync forever.
+    deadline = time.monotonic() + SYNC_INTERVAL_MINUTES * 60
+    last_keepalive = time.monotonic()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        chunk = min(KEEPALIVE_INTERVAL, remaining)
         if _CONTROL_QUEUE is not None:
-            # Wake early for an external power request instead of waiting out the
-            # keepalive chunk. An interrupted wait does not advance the sync
-            # clock, so the next scheduled sync still lands on time.
-            if await _CONTROL_QUEUE.wait(chunk):
-                await process_control_requests(tvs_to_keepalive)
-                continue
+            await _CONTROL_QUEUE.wait(chunk)
+            await process_control_requests(tvs_to_keepalive)
         else:
             await asyncio.sleep(chunk)
-        elapsed += chunk
-        if elapsed < sync_interval_seconds:
+        # Ping at most once per KEEPALIVE_INTERVAL, even when control requests
+        # keep waking the wait early.
+        if tvs_to_keepalive and time.monotonic() - last_keepalive >= KEEPALIVE_INTERVAL:
+            last_keepalive = time.monotonic()
             for tv_sync in tvs_to_keepalive:
                 try:
                     # get_artmode_status, not get_content_list — see the probe in

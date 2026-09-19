@@ -65,28 +65,48 @@ class ControlQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await queue.wait(0.01))
 
     async def test_wait_processes_requests_before_the_full_interval(self):
-        class OneShotQueue:
-            def __init__(self):
-                self.calls = 0
-
+        class AlwaysWakeQueue:
             async def wait(self, timeout):
-                self.calls += 1
-                return self.calls == 1
+                return True
 
             def drain(self):
                 return []
 
         with (
-            patch.object(sync_artwork, "_CONTROL_QUEUE", OneShotQueue()),
+            patch.object(sync_artwork, "_CONTROL_QUEUE", AlwaysWakeQueue()),
             patch.object(sync_artwork, "SYNC_INTERVAL_MINUTES", 1),
             patch.object(sync_artwork, "KEEPALIVE_INTERVAL", 60),
+            patch.object(sync_artwork, "time") as fake_time,
             patch.object(
                 sync_artwork, "process_control_requests", AsyncMock()
             ) as process,
         ):
+            fake_time.monotonic.side_effect = [0.0, 0.0, 0.0, 30.0, 60.0]
             await sync_artwork.wait_until_next_sync([])
 
-        process.assert_awaited_once()
+        self.assertGreaterEqual(process.await_count, 1)
+
+    async def test_frequent_control_requests_do_not_starve_next_sync(self):
+        class AlwaysWakeQueue:
+            async def wait(self, timeout):
+                return True
+
+            def drain(self):
+                return []
+
+        with (
+            patch.object(sync_artwork, "_CONTROL_QUEUE", AlwaysWakeQueue()),
+            patch.object(sync_artwork, "SYNC_INTERVAL_MINUTES", 1),
+            patch.object(sync_artwork, "KEEPALIVE_INTERVAL", 60),
+            patch.object(sync_artwork, "time") as fake_time,
+            patch.object(sync_artwork, "process_control_requests", AsyncMock()),
+        ):
+            # A poll every 15s is faster than KEEPALIVE_INTERVAL and used to
+            # postpone the next sync forever.
+            fake_time.monotonic.side_effect = [0.0, 0.0, 15.0, 30.0, 45.0, 60.0]
+            await asyncio.wait_for(
+                sync_artwork.wait_until_next_sync([]), timeout=1
+            )
 
     async def test_process_control_requests_resolves_future(self):
         queue = ControlQueue()

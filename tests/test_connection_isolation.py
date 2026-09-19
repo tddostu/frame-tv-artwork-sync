@@ -222,8 +222,11 @@ class ConnectionIsolationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(sync_artwork, "SYNC_INTERVAL_MINUTES", 1),
             patch.object(sync_artwork, "KEEPALIVE_INTERVAL", 60),
             patch.object(sync_artwork.asyncio, "sleep", AsyncMock()),
+            patch.object(sync_artwork, "time") as fake_time,
             self.assertLogs("sync_artwork", level="INFO") as logs,
         ):
+            # deadline, last_keepalive, one remaining check, then expired.
+            fake_time.monotonic.side_effect = [0.0, 0.0, 0.0, 60.0]
             await sync_artwork.wait_until_next_sync([])
 
         self.assertTrue(
