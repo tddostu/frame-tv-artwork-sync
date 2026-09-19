@@ -196,6 +196,32 @@ class ControlExecutionTests(unittest.IsolatedAsyncioTestCase):
             {"ip": "192.0.2.10", "state": "unknown"},
         )
 
+    async def test_status_without_a_live_client_avoids_sync_state(self):
+        control = MagicMock()
+        control.paired = True
+        control.get_power_state = AsyncMock(return_value="powerOff")
+
+        with (
+            patch.object(
+                sync_artwork, "SamsungIPControl", return_value=control
+            ) as ip_control,
+            patch.object(sync_artwork, "TVArtworkSync") as artwork_sync,
+        ):
+            result = await sync_artwork._control_status("192.0.2.10", None)
+
+        self.assertEqual(result, {"ip": "192.0.2.10", "state": "off"})
+        ip_control.assert_called_once()
+        artwork_sync.assert_not_called()
+
+    async def test_status_without_a_live_client_is_unknown_when_unpaired(self):
+        control = MagicMock()
+        control.paired = False
+
+        with patch.object(sync_artwork, "SamsungIPControl", return_value=control):
+            result = await sync_artwork._control_status("192.0.2.10", None)
+
+        self.assertEqual(result, {"ip": "192.0.2.10", "state": "unknown"})
+
     async def test_on_leaves_an_already_on_tv_untouched(self):
         tv = make_tv(art_status="on")
         tv.turn_on = AsyncMock(return_value=True)

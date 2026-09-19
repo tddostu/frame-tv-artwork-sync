@@ -1654,30 +1654,44 @@ async def execute_control_request(
     return await _control_off(ip, tv_sync)
 
 
-async def _control_status(ip: str, tv_sync: Optional['TVArtworkSync']) -> Dict[str, Any]:
-    """Report off / art / on from IP Control plus the cached art status."""
-    owned = tv_sync is None
-    if tv_sync is None:
-        tv_sync = TVArtworkSync(ip)
+def _ip_control_path(ip: str) -> Path:
+    """IP Control token path, matching TVArtworkSync.ip_control_file."""
+    return Path(TOKEN_DIR) / f'tv_{ip.replace(".", "_")}_ip_control.json'
+
+
+async def _read_power_state(ip_control: SamsungIPControl) -> Optional[str]:
+    """Read the semantic power state, or None when it cannot be determined."""
+    if not ip_control.paired:
+        return None
     try:
-        power = None
-        if tv_sync.ip_control.paired:
-            try:
-                power = await tv_sync.ip_control.get_power_state()
-            except IPControlError:
-                power = None
-        if power == 'powerOff':
-            state = 'off'
-        elif power == 'powerOn':
-            state = 'art' if tv_sync.last_art_mode_status == 'on' else 'on'
-        elif tv_sync.last_art_mode_status == 'on':
-            state = 'art'
-        else:
-            state = 'unknown'
-        return {"ip": ip, "state": state}
-    finally:
-        if owned:
-            await tv_sync.close()
+        return await ip_control.get_power_state()
+    except IPControlError:
+        return None
+
+
+async def _control_status(ip: str, tv_sync: Optional['TVArtworkSync']) -> Dict[str, Any]:
+    """Report off / art / on from IP Control plus any cached art status.
+
+    Without a live Art client this reads IP Control directly instead of
+    constructing a TVArtworkSync, which would reload the per-TV mapping from
+    disk and log it on every status poll.
+    """
+    if tv_sync is not None:
+        power = await _read_power_state(tv_sync.ip_control)
+        art_status = tv_sync.last_art_mode_status
+    else:
+        power = await _read_power_state(SamsungIPControl(ip, _ip_control_path(ip)))
+        art_status = None
+
+    if power == 'powerOff':
+        state = 'off'
+    elif power == 'powerOn':
+        state = 'art' if art_status == 'on' else 'on'
+    elif art_status == 'on':
+        state = 'art'
+    else:
+        state = 'unknown'
+    return {"ip": ip, "state": state}
 
 
 async def _control_on(ip: str, tv_sync: Optional['TVArtworkSync']) -> Dict[str, Any]:
